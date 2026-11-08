@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output (main.js is copied into the vault; keep source tracked only)
+dist/
+*.js.map
+
+# Local vault-override paths for copy-files.mjs (one vault path per line)
+.copy-files.local
+
+# Obsidian local / e2e vaults
+*.e2e-vault/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# cecli agent working directory
+.ce/
+.cecli*

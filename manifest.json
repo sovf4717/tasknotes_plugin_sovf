@@ -1,0 +1,10 @@
+{
+	"id": "tasknotes-plugin-sovf",
+	"name": "TaskNotes SOVF - Personal Extensions",
+	"version": "0.1.0",
+	"minAppVersion": "1.12.2",
+	"description": "Personal companion extensions for TaskNotes: agenda completion time insertion, diary calendar navigation, ENDONDONE (end-after-done-N) recurrence, and per-occurrence completedAt tracking.",
+	"author": "sovf",
+	"authorUrl": "https://github.com/sovf",
+	"isDesktopOnly": false
+}
