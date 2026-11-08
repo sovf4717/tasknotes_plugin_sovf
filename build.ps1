@@ -65,3 +65,4 @@ foreach ($f in $Artifacts) {
 
 Write-Host ""
 Write-Host "Done. Restart (or reload) Obsidian to pick up the plugin in '$VaultPluginsDir\$PluginId'." -ForegroundColor Green
+pwsh
