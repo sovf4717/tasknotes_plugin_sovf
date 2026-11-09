@@ -208,6 +208,9 @@ export default class Sovf4717Plugin extends Plugin {
 		// Resolve the occurrence date this completion belongs to. Prefer the
 		// newest complete_instances entry (TaskNotes appends the new date at
 		// the end); fall back to the scheduled date, then to today.
+		// Resolve the occurrence date this completion belongs to. Prefer the
+		// newest complete_instances entry (TaskNotes appends the new date at
+		// the end); fall back to the scheduled date, then to today.
 		const resolveOccurrenceDate = (
 			beforeTask: SovfTaskInfo | undefined | null,
 			afterTask: SovfTaskInfo | undefined | null
