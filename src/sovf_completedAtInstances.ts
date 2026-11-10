@@ -10,22 +10,14 @@ import type { SovfCompletedAtInstance } from "./sovf_types";
 
 export const SOVF_COMPLETED_AT_INSTANCES_PROPERTY = "completedAtInstances";
 export const SOVF_COMPLETED_AT_PROPERTY = "completedAt";
-
 /**
  * Build a completion timestamp value in "YYYY-MM-DDTHH:mm" format.
- * If the occurrence date is today, records the actual current time.
- * Otherwise, records midnight of that date.
+ * Always records the actual clock time at the moment of completion.
  */
 export function sovfBuildCompletedAtValue(occurrenceDate: string, now: Date = new Date()): string {
-	const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
-		now.getDate()
-	).padStart(2, "0")}`;
-	if (occurrenceDate === today) {
-		const hh = String(now.getHours()).padStart(2, "0");
-		const mm = String(now.getMinutes()).padStart(2, "0");
-		return `${today}T${hh}:${mm}`;
-	}
-	return `${occurrenceDate}T00:00`;
+	const hh = String(now.getHours()).padStart(2, "0");
+	const mm = String(now.getMinutes()).padStart(2, "0");
+	return `${occurrenceDate}T${hh}:${mm}`;
 }
 
 /**

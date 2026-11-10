@@ -34,6 +34,7 @@ import {
 import {
 	SOVF_END_AFTER_DONE_COUNT_PROPERTY,
 	sovfEndAfterDoneCountFromTask,
+	sovfNormalizeEndOnDoneRecurrence,
 } from "./sovf_endOnDone";
 import { sovfResolveDailyNoteDate } from "./sovf_calendarNavigation";
 
@@ -161,6 +162,8 @@ export default class Sovf4717Plugin extends Plugin {
 
 	// The base file path that hosts the agenda view we insert into.
 	private static readonly AGENDA_BASE = "TaskNotes/Views/agenda-default.base";
+	// The embed marker string that must appear in the active note for insertion.
+	private static readonly AGENDA_EMBED_MARKER = "![[TaskNotes/Views/agenda-default.base]]";
 
 	async onload(): Promise<void> {
 		// Wait for tasknotes to load and expose its public .api.
@@ -208,20 +211,6 @@ export default class Sovf4717Plugin extends Plugin {
 	private registerCompletionSideEffects(): void {
 		const app = this.app;
 		const api = this.tasknotes!.api!;
-
-		// Cache the list of agenda embed files; refresh every 30s.
-		let agendaEmbedFiles: string[] = [];
-		void (async () => {
-			agendaEmbedFiles = await findBaseEmbedFiles(app, Sovf4717Plugin.AGENDA_BASE);
-		})();
-		this.agendaRefreshIntervalId = window.setInterval(
-			() => {
-				void (async () => {
-					agendaEmbedFiles = await findBaseEmbedFiles(app, Sovf4717Plugin.AGENDA_BASE);
-				})();
-			},
-			30_000
-		);
 
 		// De-dup: recurring completion can fire both a `task.updated`-derived
 		// completion and `recurring.instance.completed` for the same
@@ -344,25 +333,25 @@ export default class Sovf4717Plugin extends Plugin {
 			}
 			const timeLabel = recordedTime || sovfGetCurrentTimeLabel();
 
-			// 4) Insert the completion line into the diary matching the occurrence
-			//    date (A1). Pick the single agenda-embedding note whose date resolves
-			//    to this occurrence; if none matches, fall back to the note for today.
-			const targetDiary = pickDiaryForDate(agendaEmbedFiles, occurrenceDate, this.todayString());
-			for (const diaryPath of targetDiary) {
-				const diaryFile = app.vault.getAbstractFileByPath(diaryPath);
-				if (!(diaryFile instanceof TFile)) continue;
-				try {
-					const diaryContent = await app.vault.read(diaryFile);
-					const updated = sovfInsertAgendaCompletionLine(
-						diaryContent,
-						taskTitle,
-						timeLabel
-					);
-					if (updated !== diaryContent) {
-						await app.vault.modify(diaryFile, updated);
+			// 4) Insert the completion line into the CURRENTLY ACTIVE diary file
+			//    (the one the user is looking at), just above the embed.
+			//    We only touch a file when it actually embeds the agenda base.
+			const activeFile = app.workspace.getActiveFile();
+			if (activeFile && activeFile instanceof TFile) {
+				const activeContent = await app.vault.read(activeFile);
+				if (activeContent.includes(Sovf4717Plugin.AGENDA_EMBED_MARKER)) {
+					try {
+						const updated = sovfInsertAgendaCompletionLine(
+							activeContent,
+							taskTitle,
+							timeLabel
+						);
+						if (updated !== activeContent) {
+							await app.vault.modify(activeFile, updated);
+						}
+					} catch {
+						// Silently ignore read/write errors
 					}
-				} catch {
-					// Silently ignore read/write errors
 				}
 			}
 		};
@@ -460,6 +449,20 @@ export default class Sovf4717Plugin extends Plugin {
 			recurrence,
 			completeInstances,
 		});
+		// 1) Normalize so the TaskNotes model actually enforces the cap: rewrite
+		//    a non-standard ENDONDONE=N token into a standard COUNT=N (the only
+		//    bound the upstream recurrence engine understands).
+		if (typeof frontmatter.recurrence === "string") {
+			const normalized = sovfNormalizeEndOnDoneRecurrence(
+				frontmatter.recurrence,
+				sovfEndAfterDoneCountFromTask({ frontmatter })
+			);
+			if (normalized !== undefined && normalized !== frontmatter.recurrence) {
+				frontmatter.recurrence = normalized;
+			}
+		}
+
+		// 2) If the cap has been reached, fully terminate the recurrence.
 		if (cap !== null && completeInstances.length >= cap) {
 			delete frontmatter.recurrence;
 			delete frontmatter[SOVF_END_AFTER_DONE_COUNT_PROPERTY];
@@ -471,7 +474,7 @@ export default class Sovf4717Plugin extends Plugin {
 
 	// ── Diary calendar navigation ──────────────────────────────────────────
 
-	private registerDiaryNavigation(): void {
+private registerDiaryNavigation(): void {
 		const workspace = this.app.workspace;
 		let lastDailyNoteDate: string | null = null;
 
@@ -483,19 +486,60 @@ export default class Sovf4717Plugin extends Plugin {
 			if (!dateStr || dateStr === lastDailyNoteDate) return;
 			lastDailyNoteDate = dateStr;
 
-			// Ask the TaskNotes plugin to jump its calendar/agenda to that date.
+			// 1) Ask TaskNotes to open the daily note (keeps existing behaviour).
 			const plugin = this.tasknotes;
 			if (plugin && typeof plugin.navigateToDailyNote === "function") {
 				const [y, m, d] = dateStr.split("-").map(Number);
 				const localDate = new Date(y, m - 1, d);
 				void plugin.navigateToDailyNote(localDate, { isAlreadyLocal: true });
 			}
+
+			// 2) Drive the embedded Bases calendar to this date by updating the
+			//    `initialDate` field in the agenda-default.base file. TaskNotes'
+			//    CalendarView only calls gotoDate() when the initialDate config
+			//    value changes (detected via shouldPreserveVisibleDateOnCalendarRecreate),
+			//    so writing a new initialDate triggers the navigation.
+			void this.updateAgendaBaseInitialDate(dateStr);
 		};
 
 		this.registerEvent(workspace.on("active-leaf-change", tryNavigateToDiaryNote));
 		this.registerEvent(workspace.on("file-open", tryNavigateToDiaryNote));
 	}
 
+	/**
+	 * Update the `initialDate` field in agenda-default.base to the given date string.
+	 * This causes TaskNotes' Bases calendar to navigate to that date on next refresh.
+	 */
+	private async updateAgendaBaseInitialDate(dateStr: string): Promise<void> {
+		const baseFile = this.app.vault.getAbstractFileByPath(
+			Sovf4717Plugin.AGENDA_BASE
+		) as TFile | null;
+		if (!baseFile || !(baseFile instanceof TFile)) return;
+
+		try {
+			const raw = await this.app.vault.read(baseFile);
+			// Replace or insert the initialDate line with the new date.
+			const lines = raw.split("\n");
+			let found = false;
+			for (let i = 0; i < lines.length; i++) {
+				if (/^\s*initialDate:/.test(lines[i])) {
+					lines[i] = lines[i].replace(/^\s*initialDate:.*/, `    initialDate: "${dateStr}"`);
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				// Append initialDate before the first closing brace or at the end of the view block
+				lines.push(`    initialDate: "${dateStr}"`);
+			}
+			const updated = lines.join("\n");
+			if (updated !== raw) {
+				await this.app.vault.modify(baseFile, updated);
+			}
+		} catch {
+			// Ignore write errors; navigation still works via navigateToDailyNote.
+		}
+	}
 	// ── Frontmatter helpers ─────────────────────────────────────────────────
 
 	private todayString(): string {
