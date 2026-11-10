@@ -27,6 +27,7 @@ import { sovfGetCurrentTimeLabel, sovfInsertAgendaCompletionLine } from "./sovf_
 import {
 	sovfBuildCompletedAtValue,
 	sovfNormalizeCompletedAtInstances,
+	sovfGetCompletedAtTimeForDate,
 	SOVF_COMPLETED_AT_INSTANCES_PROPERTY,
 	SOVF_COMPLETED_AT_PROPERTY,
 } from "./sovf_completedAtInstances";
@@ -128,6 +129,29 @@ async function findBaseEmbedFiles(app: App, basePath: string): Promise<string[]>
 	return result;
 }
 
+/**
+ * From a list of candidate diary paths (notes embedding the agenda base),
+ * return only those whose resolved date matches the given occurrence date.
+ * Falls back to the candidate(s) whose date is today when no candidate
+ * matches the occurrence date exactly.
+ */
+function pickDiaryForDate(
+	candidates: string[],
+	occurrenceDate: string,
+	todayStr: string
+): string[] {
+	if (candidates.length === 0) return [];
+	const matched = candidates.filter(
+		(p) => sovfResolveDailyNoteDate(p) === occurrenceDate
+	);
+	if (matched.length > 0) return matched;
+	// Fall back to today's diary if the occurrence-date diary doesn't exist.
+	const todayMatched = candidates.filter(
+		(p) => sovfResolveDailyNoteDate(p) === todayStr
+	);
+	return todayMatched.length > 0 ? todayMatched : [candidates[0]];
+}
+
 // ─── Plugin class ────────────────────────────────────────────────────────────
 
 export default class Sovf4717Plugin extends Plugin {
@@ -211,18 +235,28 @@ export default class Sovf4717Plugin extends Plugin {
 		// Resolve the occurrence date this completion belongs to. Prefer the
 		// newest complete_instances entry (TaskNotes appends the new date at
 		// the end); fall back to the scheduled date, then to today.
+		// Resolve the occurrence date this completion belongs to. Use the
+		// materialized occurrence's own date (`occurrence_date` / `occurrenceDate`
+		// custom property) when present — TaskNotes sets it on recurring tasks
+		// — else the newest complete_instances entry, else scheduled, else today.
 		const resolveOccurrenceDate = (
 			beforeTask: SovfTaskInfo | undefined | null,
 			afterTask: SovfTaskInfo | undefined | null
 		): string => {
 			const after = afterTask;
+
+			// 1) Authoritative source: the occurrence's own target date.
+			const occurrenceDateField =
+				(typeof after?.occurrence_date === "string" && after.occurrence_date) ||
+				"";
+			if (occurrenceDateField) return occurrenceDateField;
+
+			// 2) Newest complete_instances entry (TaskNotes appends the new date
+			//    at the end when a recurring instance is completed).
 			const completeInstances: string[] =
 				(after?.complete_instances as string[] | undefined) ??
 				(after?.customProperties?.complete_instances as string[] | undefined) ??
 				[];
-			if (completeInstances.length > 0) {
-				return completeInstances[completeInstances.length - 1];
-			}
 			const beforeComplete: string[] =
 				(beforeTask?.complete_instances as string[] | undefined) ??
 				(beforeTask?.customProperties?.complete_instances as string[] | undefined) ??
@@ -231,10 +265,14 @@ export default class Sovf4717Plugin extends Plugin {
 				const newOnes = completeInstances.slice(beforeComplete.length);
 				if (newOnes.length > 0) return newOnes[newOnes.length - 1];
 			}
+
+			// 3) Scheduled date (the occurrence the task is anchored to).
 			const scheduled =
 				(typeof after?.scheduled === "string" && after.scheduled) ||
 				(typeof beforeTask?.scheduled === "string" && beforeTask.scheduled) ||
 				"";
+
+			// 4) Fall back to today.
 			return scheduled || this.todayString();
 		};
 
@@ -260,9 +298,12 @@ export default class Sovf4717Plugin extends Plugin {
 				}
 			}
 
-			const timeLabel = sovfGetCurrentTimeLabel();
+			// 1) Write per-occurrence completedAtInstances + ENDONDONE to the
+			//    task's own frontmatter first, so we can read the real
+			//    completion time of this occurrence back for the diary line.
+			await this.applyCompletionSideEffects(taskPath, afterTask, occurrenceDate);
 
-			// Resolve task title robustly: payload (after -> before) -> API -> filename fallback.
+			// 2) Resolve the task title robustly: payload (after -> before) -> API -> filename fallback.
 			let taskTitle = afterTask?.title;
 			if (!taskTitle) {
 				taskTitle = beforeTask?.title;
@@ -279,28 +320,51 @@ export default class Sovf4717Plugin extends Plugin {
 				taskTitle = taskPath.replace(/\.md$/i, "").replace(/^.*\//, "");
 			}
 
-			// 1) Insert the completion line into every agenda-embedding note.
-			for (const embedPath of agendaEmbedFiles) {
-				const embedFile = app.vault.getAbstractFileByPath(embedPath);
-				if (!(embedFile instanceof TFile)) continue;
+			// 3) Time label: prefer the recorded completion time for THIS occurrence
+			//    (B1), falling back to the trigger-time label when no recorded value
+			//    exists (e.g. a one-shot task just completed now).
+			const taskFile = app.vault.getAbstractFileByPath(taskPath);
+			let recordedTime = "";
+			if (taskFile instanceof TFile) {
 				try {
-					const embedContent = await app.vault.read(embedFile);
+					const raw = await app.vault.read(taskFile);
+					const parsed = this.parseFrontmatter(raw);
+					if (parsed) {
+						recordedTime =
+							sovfGetCompletedAtTimeForDate(
+								parsed.frontmatter,
+								occurrenceDate,
+								[parsed.frontmatter[SOVF_COMPLETED_AT_PROPERTY]]
+							) ??
+							"";
+					}
+				} catch {
+					/* ignore */
+				}
+			}
+			const timeLabel = recordedTime || sovfGetCurrentTimeLabel();
+
+			// 4) Insert the completion line into the diary matching the occurrence
+			//    date (A1). Pick the single agenda-embedding note whose date resolves
+			//    to this occurrence; if none matches, fall back to the note for today.
+			const targetDiary = pickDiaryForDate(agendaEmbedFiles, occurrenceDate, this.todayString());
+			for (const diaryPath of targetDiary) {
+				const diaryFile = app.vault.getAbstractFileByPath(diaryPath);
+				if (!(diaryFile instanceof TFile)) continue;
+				try {
+					const diaryContent = await app.vault.read(diaryFile);
 					const updated = sovfInsertAgendaCompletionLine(
-						embedContent,
+						diaryContent,
 						taskTitle,
 						timeLabel
 					);
-					if (updated !== embedContent) {
-						await app.vault.modify(embedFile, updated);
+					if (updated !== diaryContent) {
+						await app.vault.modify(diaryFile, updated);
 					}
 				} catch {
 					// Silently ignore read/write errors
 				}
 			}
-
-			// 2) Per-occurrence completedAtInstances + 3) ENDONDONE, both on the
-			//    task's own frontmatter. Read the raw file, update, write back.
-			await this.applyCompletionSideEffects(taskPath, afterTask, occurrenceDate);
 		};
 
 		// Register listeners via the api.events facade.
